@@ -4,6 +4,7 @@ from torchvision import transforms
 from PIL import Image
 
 from dataset.caption_dataset import re_train_dataset, re_eval_dataset, pretrain_dataset
+from dataset.caption_dataset_v2 import pretrain_dataset_v2
 from dataset.nlvr_dataset import nlvr_dataset
 from dataset.ve_dataset import ve_dataset
 from dataset.vqa_dataset import vqa_dataset
@@ -38,7 +39,8 @@ def create_dataset(dataset, config):
         ])   
     
     if dataset=='pretrain':
-        dataset = pretrain_dataset(config['train_file'], pretrain_transform)                  
+        #dataset = pretrain_dataset(config['train_file'], pretrain_transform)    
+        dataset = pretrain_dataset_v2(config['train_file'], pretrain_transform)             
         return dataset      
                
     elif dataset=='re':          
