@@ -7,6 +7,21 @@ import datetime
 
 import torch
 import torch.distributed as dist
+import wandb
+
+def make_wandb(model_dir, cfg):
+    if is_main_process():
+        wandb.login(key='5421ff43bf1e3a6e19103432d161c885d4bbeda8')
+        run = wandb.init(project='ALBEF_Img2Poem', 
+                    #entity=model_dir, 
+                    config=cfg, reinit=True)
+        #wandb.run.name = model_dir.replace('experiments/','')
+        wandb.run.name = '/'.join(model_dir.split('/')[-2:])
+        wandb.run.save()
+        return run
+    else:
+        return None
+
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a

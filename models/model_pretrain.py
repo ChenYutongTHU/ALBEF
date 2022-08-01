@@ -103,23 +103,23 @@ class ALBEF(nn.Module):
         with torch.no_grad():
             self._momentum_update()
             image_embeds_m = self.visual_encoder_m(image) 
-            image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1)  
-            image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)                                         
+            image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1)  #B,D
+            image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)   #D,N_i                                    
             text_output_m = self.text_encoder_m.bert(text.input_ids, attention_mask = text.attention_mask,                      
                                                 return_dict = True, mode = 'text')    
             text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
-            text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1)
+            text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1) #D, N_t
 
-            sim_i2t_m = image_feat_m @ text_feat_all / self.temp 
-            sim_t2i_m = text_feat_m @ image_feat_all / self.temp     
+            sim_i2t_m = image_feat_m @ text_feat_all / self.temp  # B, D @ D,N_t  (B, N_t)
+            sim_t2i_m = text_feat_m @ image_feat_all / self.temp # B, D @ D, N_i   (B, N_i)
 
-            sim_targets = torch.zeros(sim_i2t_m.size()).to(image.device)
+            sim_targets = torch.zeros(sim_i2t_m.size()).to(image.device) #(B, N_t) (N_t==N_i?)
             sim_targets.fill_diagonal_(1)          
 
             sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
             sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets        
 
-        sim_i2t = image_feat @ text_feat_all / self.temp 
+        sim_i2t = image_feat @ text_feat_all / self.temp  #(B,N)
         sim_t2i = text_feat @ image_feat_all / self.temp 
                              
         loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_i2t_targets,dim=1).mean()
@@ -140,18 +140,18 @@ class ALBEF(nn.Module):
                                        )            
         with torch.no_grad():
             bs = image.size(0)          
-            weights_i2t = F.softmax(sim_i2t[:,:bs],dim=1)
+            weights_i2t = F.softmax(sim_i2t[:,:bs],dim=1) #(B,B)
             weights_t2i = F.softmax(sim_t2i[:,:bs],dim=1)
    
-            weights_i2t.fill_diagonal_(0)
+            weights_i2t.fill_diagonal_(0) #do not choose the positive sample
             weights_t2i.fill_diagonal_(0)
 
         # select a negative image for each text
         image_embeds_neg = []    
         for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2i[b], 1).item()
+            neg_idx = torch.multinomial(weights_t2i[b], 1).item()  #B 
             image_embeds_neg.append(image_embeds[neg_idx])
-        image_embeds_neg = torch.stack(image_embeds_neg,dim=0)   
+        image_embeds_neg = torch.stack(image_embeds_neg,dim=0)    #B,
 
         # select a negative text for each image
         text_embeds_neg = []
@@ -160,16 +160,16 @@ class ALBEF(nn.Module):
             neg_idx = torch.multinomial(weights_i2t[b], 1).item()
             text_embeds_neg.append(text_embeds[neg_idx])
             text_atts_neg.append(text.attention_mask[neg_idx])
-        text_embeds_neg = torch.stack(text_embeds_neg,dim=0)   
-        text_atts_neg = torch.stack(text_atts_neg,dim=0)      
+        text_embeds_neg = torch.stack(text_embeds_neg,dim=0)   #B,D
+        text_atts_neg = torch.stack(text_atts_neg,dim=0)      #B
 
-        text_embeds_all = torch.cat([text_embeds, text_embeds_neg],dim=0)     
+        text_embeds_all = torch.cat([text_embeds, text_embeds_neg],dim=0)      #2B, d
         text_atts_all = torch.cat([text.attention_mask, text_atts_neg],dim=0)     
 
-        image_embeds_all = torch.cat([image_embeds_neg,image_embeds],dim=0)
+        image_embeds_all = torch.cat([image_embeds_neg,image_embeds],dim=0) #2B,D
         image_atts_all = torch.cat([image_atts,image_atts],dim=0)
 
-        output_neg = self.text_encoder.bert(encoder_embeds = text_embeds_all, 
+        output_neg = self.text_encoder.bert(encoder_embeds = text_embeds_all, #2B,N
                                         attention_mask = text_atts_all,
                                         encoder_hidden_states = image_embeds_all,
                                         encoder_attention_mask = image_atts_all,      
@@ -234,10 +234,10 @@ class ALBEF(nn.Module):
     @torch.no_grad()
     def _dequeue_and_enqueue(self, image_feat, text_feat):
         # gather keys before updating queue
-        image_feats = concat_all_gather(image_feat)
+        image_feats = concat_all_gather(image_feat) #gather from all processes
         text_feats = concat_all_gather(text_feat)
 
-        batch_size = image_feats.shape[0]
+        batch_size = image_feats.shape[0] #n_gpu*B
 
         ptr = int(self.queue_ptr)
         assert self.queue_size % batch_size == 0  # for simplicity

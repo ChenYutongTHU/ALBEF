@@ -66,5 +66,5 @@ class pretrain_dataset_v2(Dataset):
       
         # image = Image.open(ann['image']).convert('RGB')   
                 
-        return image, caption
+        return index, image, caption
             

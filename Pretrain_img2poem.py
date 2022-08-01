@@ -31,8 +31,11 @@ from dataset import create_dataset, create_sampler, create_loader
 from scheduler import create_scheduler
 from optim import create_optimizer
 
+import wandb
+from utils import make_wandb
 
-def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
+
+def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, wandb_run):
     # train
     model.train()  
     
@@ -50,17 +53,12 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)
 
-    for i, (image, text) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for i, (imgid, image, text) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         
         optimizer.zero_grad()
   
         image = image.to(device,non_blocking=True) 
-
-        print(image.shape)
-        print(text)
         text_input = tokenizer(text, padding='longest', truncation=True, max_length=25, return_tensors="pt").to(device)  
-        print(text_input)
-        input()
         if epoch>0:
             alpha = config['alpha']
         else:
@@ -77,7 +75,13 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         metric_logger.update(loss_ita=loss_ita.item())
         metric_logger.update(loss_itm=loss_itm.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
-        
+        if wandb_run!=None:
+            wandb.log({
+                'train/loss_mlm':loss_mlm, 'train/loss_ita':loss_ita, 'train/loss_itm':loss_itm, 
+                'train/loss':loss,
+                'train/lr':optimizer.param_groups[0]["lr"]
+                })
+
         if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
             scheduler.step(i//step_size)         
         
@@ -91,6 +95,8 @@ def main(args, config):
     utils.init_distributed_mode(args)    
     
     device = torch.device(args.device)
+
+    wandb_run = make_wandb(model_dir=args.output_dir, cfg=config) #None for other processes
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -158,7 +164,7 @@ def main(args, config):
         if epoch>0:
             lr_scheduler.step(epoch+warmup_steps)  
             
-        train_stats = train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config) 
+        train_stats = train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, wandb_run) 
         if utils.is_main_process():  
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch,
