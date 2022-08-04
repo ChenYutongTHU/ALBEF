@@ -12,6 +12,33 @@ Image.MAX_IMAGE_PIXELS = None
 #from dataset.utils import pre_caption #
 from dataset.read_tsv import TSVFile
 
+from glob import glob
+
+def is_image(filename):
+    for ext in ['.png', '.jpg', '.jpeg']:
+        if ext in filename:
+            return True
+    return False
+class re_img2poem_test_dataset(Dataset):
+    def __init__(self, test_img_dir, text_file, transform):
+        self.img2path = []
+        self.transform = transform
+        for filename in os.listdir(test_img_dir):
+            if is_image(filename):
+                imgname = os.path.basename(filename).split('.')[0]
+                self.img2path.append([imgname, os.path.join(test_img_dir, filename)])
+        self.text = json.load(open(text_file, 'r'))
+
+    def __len__(self):
+        return len(self.img2path)
+
+    def __getitem__(self, index): 
+        imgname, filename = self.img2path[index]
+        image = Image.open(filename).convert('RGB')   
+        image = self.transform(image)     
+        return imgname, filename, image
+
+
 def img_from_base64(imagestring, color=True):
     img_str = base64.b64decode(imagestring)
     try:

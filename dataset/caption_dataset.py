@@ -10,8 +10,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
 from dataset.utils import pre_caption
-
-
+   
 class re_train_dataset(Dataset):
     def __init__(self, ann_file, transform, image_root, max_words=30):        
         self.ann = []
