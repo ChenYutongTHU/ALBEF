@@ -52,16 +52,19 @@ def img_from_base64(imagestring, color=True):
         return None
 
 class pretrain_dataset_v2(Dataset):
-    def __init__(self, ann_file, transform, max_words=30):  
+    def __init__(self, ann_file, transform, sample_caption=False, max_words=30):  
         self.text_file = ann_file['text_file']   
         self.id2text = json.load(open(self.text_file,'r'))
         assert '.tsv' in ann_file['img_file']
         self.tsv = TSVFile(ann_file['img_file'])
         self.total_num = self.tsv.num_rows()
         assert '.pkl' in ann_file['img2text']
-        self.imgid2textid = pickle.load(open(ann_file['img2text'],'rb'))
+        self.imgid2textids = pickle.load(open(ann_file['img2text'],'rb'))
+        if type(self.imgid2textids[0])!=list:
+            self.imgid2textids = [[top1] for top1 in self.imgid2textids]
         self.transform = transform
         self.max_words = max_words
+        self.sample_caption = sample_caption
         
         
     def __len__(self):
@@ -84,8 +87,12 @@ class pretrain_dataset_v2(Dataset):
         image = self.get_image_item(index)
         image = self.transform(image)
 
-        txt_id = self.imgid2textid[index]
-        caption = self.id2text[txt_id] #to-preprocess ? or tokenize
+        if self.sample_caption:
+            txt_id = random.choice(self.imgid2textids[index])
+        else:
+            txt_id = self.imgid2textids[index][0]
+
+        caption = self.id2text[txt_id]
         # if type(ann['caption']) == list:
         #     caption = pre_caption(random.choice(ann['caption']), self.max_words)
         # else:

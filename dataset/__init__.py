@@ -40,7 +40,7 @@ def create_dataset(dataset, config):
     
     if dataset=='pretrain':
         #dataset = pretrain_dataset(config['train_file'], pretrain_transform)    
-        dataset = pretrain_dataset_v2(config['train_file'], pretrain_transform)             
+        dataset = pretrain_dataset_v2(config['train_file'], pretrain_transform, sample_caption=config.get('sample_caption',False))             
         return dataset      
 
     elif dataset=='re_img2poem':
