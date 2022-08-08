@@ -36,9 +36,10 @@ class ALBEF(nn.Module):
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6))   
         
         if init_deit:
-            checkpoint = torch.hub.load_state_dict_from_url(
-                url="https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth",
-                map_location="cpu", check_hash=True)
+            # checkpoint = torch.hub.load_state_dict_from_url(
+            #     url="https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth",
+            #     map_location="cpu", check_hash=True)
+            checkpoint = torch.load('pretrained_models/deit_base_patch16_224-b5f2ef4d.pth', map_location='cpu')
             state_dict = checkpoint["model"]
             pos_embed_reshaped = interpolate_pos_embed(state_dict['pos_embed'], self.visual_encoder)
             state_dict['pos_embed'] = pos_embed_reshaped
