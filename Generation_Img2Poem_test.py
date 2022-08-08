@@ -37,7 +37,7 @@ def test_img2poem_gen(args, model, config, tokenizer, device, wandb_run=None):
     samplers = [None]
     data_loader = create_loader(datasets,samplers,batch_size=[1], num_workers=[4], is_trains=[False], collate_fns=[None])[0]
     filename2result, total_ppl = {}, []
-    for i, (imgnames, filenames, images, references) in enumerate(data_loader):
+    for i, (imgnames, filenames, images, references) in tqdm(enumerate(data_loader)):
         images = images.to(device,non_blocking=True) 
         image_embeds = model.visual_encoder(images) 
         image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(images.device)
@@ -77,7 +77,7 @@ def test_img2poem_gen(args, model, config, tokenizer, device, wandb_run=None):
         total_ppl = torch.cat(total_ppl, dim=0)
         num_tokens = total_ppl.shape[0]  
         total_ppl = torch.pow(2, torch.mean(total_ppl))
-    print('#Num_tokens={} PPL={:.2f}'.format(num_tokens,total_ppl))
+        print('#Num_tokens={} PPL={:.2f}'.format(num_tokens,total_ppl))
     if wandb_run!=None and total_ppl!=[]:
         wandb.log({'eval/ppl': total_ppl})
     output_dir_result = os.path.join(args.output_dir, 'generation_results')
@@ -89,7 +89,7 @@ def main(args, config):
     device = torch.device(args.device)
     #### Dataset #### 
     print("Creating generation dataset")
-    config['test_image_dir'], config['text_file'] = args.test_image_dir, args.test_poem_reference
+    config['test_image_dir'], config['test_poem_reference'] = args.test_image_dir, args.test_poem_reference
     tokenizer = BertTokenizer.from_pretrained(args.text_encoder, add_sep=(config.get('mode','retrieval')=='generation'))
 
     #### Model #### 
