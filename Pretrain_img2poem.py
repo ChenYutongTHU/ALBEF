@@ -33,12 +33,13 @@ from optim import create_optimizer
 
 import wandb
 from utils import make_wandb
-
+from Generation_Img2Poem_test import test_img2poem_gen
+    
 
 def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, wandb_run):
     # train
     model.train()  
-    
+    mode = config.get('mode','retrieval')
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
     metric_logger.add_meter('loss_mlm', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
@@ -56,7 +57,6 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     for i, (imgid, image, text) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         
         optimizer.zero_grad()
-  
         image = image.to(device,non_blocking=True) 
         text_input = tokenizer(text, padding='longest', truncation=True, max_length=25, return_tensors="pt").to(device)  
         if epoch>0:
@@ -64,13 +64,14 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         else:
             alpha = config['alpha']*min(1,i/len(data_loader)) 
         
-        loss_mlm, loss_ita, loss_itm = model(image, text_input, alpha = alpha)  
-            
-        loss = loss_mlm + loss_ita + loss_itm    
-          
+
+
+        loss_mlm, loss_ita, loss_itm = model(image, text_input, 
+                                            alpha = alpha)
+        weights = config.get('weights',{'mlm':1,'ita':1,'itm':1})
+        loss = weights['mlm']*loss_mlm + weights['ita']*loss_ita + weights['itm']*loss_itm 
         loss.backward()
         optimizer.step()    
-        
         metric_logger.update(loss_mlm=loss_mlm.item())
         metric_logger.update(loss_ita=loss_ita.item())
         metric_logger.update(loss_itm=loss_itm.item())
@@ -122,7 +123,7 @@ def main(args, config):
 
     data_loader = create_loader(datasets,samplers,batch_size=[config['batch_size']], num_workers=[4], is_trains=[True], collate_fns=[None])[0]
 
-    tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
+    tokenizer = BertTokenizer.from_pretrained(args.text_encoder, add_sep=(config.get('mode','retrieval')=='generation'))
 
     #### Model #### 
     print("Creating model")
@@ -136,6 +137,9 @@ def main(args, config):
     lr_scheduler, _ = create_scheduler(arg_sche, optimizer)  
 
     
+    if 'load_pretrained' in config:
+        assert os.path.isfile(config['load_pretrained'])
+        args.checkpoint = config['load_pretrained']
     if args.checkpoint:    
         checkpoint = torch.load(args.checkpoint, map_location='cpu') 
         state_dict = checkpoint['model']                       
@@ -144,28 +148,37 @@ def main(args, config):
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             start_epoch = checkpoint['epoch']+1         
         else:
-            pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)   
-            m_pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder_m.pos_embed'],model.visual_encoder_m)  
-            state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped       
-            state_dict['visual_encoder_m.pos_embed'] = m_pos_embed_reshaped               
-        model.load_state_dict(state_dict)    
+            pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)     
+            state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped   
+            if hasattr(model, 'visual_encoder_m'):
+                m_pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder_m.pos_embed'],model.visual_encoder_m)    
+                state_dict['visual_encoder_m.pos_embed'] = m_pos_embed_reshaped  
+        state_dict_to_load = {}
+        for k,v in state_dict.items():
+            Flag = True
+            for m_module in ['visual_encoder_m', 'text_encoder_m', 'vision_proj_m' ,'text_proj_m']:                
+                if m_module in k and not hasattr(model, m_module):
+                    Flag = False
+                    break
+            if Flag:
+                state_dict_to_load[k] = v
+        model.load_state_dict(state_dict_to_load, strict=True)    
         print('load checkpoint from %s'%args.checkpoint)
     
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module    
     
     print("Start training")
     start_time = time.time()
-
     for epoch in range(start_epoch, max_epoch):
         
         if epoch>0:
             lr_scheduler.step(epoch+warmup_steps)  
             
         train_stats = train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, wandb_run) 
-        if utils.is_main_process():  
+        if utils.is_main_process() and epoch%config.get('save_freq',1)==0:  
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch,
                         }                     
@@ -177,9 +190,14 @@ def main(args, config):
                 'epoch': epoch,
             }
             torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_%02d.pth'%epoch))  
-            
+            print('Save as ',os.path.join(args.output_dir, 'checkpoint_%02d.pth'%epoch))
             with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+                
+            if config.get('mode','retrieval') == 'generation':
+                #evaluation
+                print(f'Evaluate @ epoch={epoch} for generation model')
+                test_img2poem_gen(args, model.module, config, tokenizer, device, wandb_run)
 
         dist.barrier()  
                 

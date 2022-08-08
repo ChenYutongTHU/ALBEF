@@ -13,6 +13,7 @@ Image.MAX_IMAGE_PIXELS = None
 from dataset.read_tsv import TSVFile
 
 from glob import glob
+from collections import defaultdict
 
 def is_image(filename):
     for ext in ['.png', '.jpg', '.jpeg']:
@@ -38,6 +39,28 @@ class re_img2poem_test_dataset(Dataset):
         image = self.transform(image)     
         return imgname, filename, image
 
+class gen_img2poem_test_dataset(Dataset):
+    def __init__(self, test_img_dir, test_poem_reference, transform):
+        self.img2path = []
+        self.transform = transform
+        for filename in os.listdir(test_img_dir):
+            if is_image(filename):
+                imgname = os.path.basename(filename).split('.')[0]
+                self.img2path.append([imgname, os.path.join(test_img_dir, filename)])
+        if test_poem_reference==None:
+            self.test_poem_reference = defaultdict(lambda :'null')
+        else:
+            test_poem_reference = pickle.load(open(test_poem_reference, 'rb'))
+            self.test_poem_reference = defaultdict(lambda :'null', test_poem_reference)
+
+    def __len__(self):
+        return len(self.img2path)
+
+    def __getitem__(self, index): 
+        imgname, filename = self.img2path[index]
+        image = Image.open(filename).convert('RGB')   
+        image = self.transform(image)     
+        return imgname, filename, image, self.test_poem_reference[imgname]
 
 def img_from_base64(imagestring, color=True):
     img_str = base64.b64decode(imagestring)

@@ -4,7 +4,7 @@ from torchvision import transforms
 from PIL import Image
 
 from dataset.caption_dataset import re_train_dataset, re_eval_dataset, pretrain_dataset
-from dataset.caption_dataset_v2 import pretrain_dataset_v2, re_img2poem_test_dataset
+from dataset.caption_dataset_v2 import pretrain_dataset_v2, re_img2poem_test_dataset, gen_img2poem_test_dataset
 from dataset.nlvr_dataset import nlvr_dataset
 from dataset.ve_dataset import ve_dataset
 from dataset.vqa_dataset import vqa_dataset
@@ -46,7 +46,10 @@ def create_dataset(dataset, config):
     elif dataset=='re_img2poem':
         test_dataset = re_img2poem_test_dataset(config['test_image_dir'], config['text_file'], test_transform)
         return test_dataset
-
+    elif dataset=='gen_img2poem':
+        test_dataset = gen_img2poem_test_dataset(config['test_image_dir'], config['test_poem_reference'], test_transform)
+        return test_dataset
+        
     elif dataset=='re':          
         train_dataset = re_train_dataset(config['train_file'], train_transform, config['image_root'])
         val_dataset = re_eval_dataset(config['val_file'], test_transform, config['image_root'])  

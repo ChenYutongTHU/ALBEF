@@ -7,8 +7,8 @@
 
 from functools import partial
 from models.vit import VisionTransformer, interpolate_pos_embed
-from models.xbert import BertConfig, BertForMaskedLM
-
+from models.xbert import BertConfig, BertForMaskedLM, BERT_LIKE
+from  transformers.modeling_outputs import BaseModelOutput
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -48,6 +48,10 @@ class ALBEF(nn.Module):
         vision_width = config['vision_width']       
         bert_config = BertConfig.from_json_file(config['bert_config'])
         
+        self.text_encoder_mode = config.get('mode','retrieval')
+        if self.text_encoder_mode == 'generation':
+            bert_config.is_encoder_decoder = True
+            bert_config.mask_token_id = tokenizer.mask_token_id
         self.text_encoder = BertForMaskedLM.from_pretrained(text_encoder, config=bert_config)      
 
         text_width = self.text_encoder.config.hidden_size
@@ -60,20 +64,21 @@ class ALBEF(nn.Module):
         self.itm_head = nn.Linear(text_width, 2)     
 
         # create momentum models
-        self.visual_encoder_m = VisionTransformer(
-            img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
-            mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6)) 
-        self.vision_proj_m = nn.Linear(vision_width, embed_dim)
-        self.text_encoder_m = BertForMaskedLM.from_pretrained(text_encoder, config=bert_config)       
-        self.text_proj_m = nn.Linear(text_width, embed_dim)    
+        if self.text_encoder_mode!='generation':
+            self.visual_encoder_m = VisionTransformer(
+                img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
+                mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6)) 
+            self.vision_proj_m = nn.Linear(vision_width, embed_dim)
+            self.text_encoder_m = BertForMaskedLM.from_pretrained(text_encoder, config=bert_config)       
+            self.text_proj_m = nn.Linear(text_width, embed_dim)    
         
-        self.model_pairs = [[self.visual_encoder,self.visual_encoder_m],
-                            [self.vision_proj,self.vision_proj_m],
-                            [self.text_encoder,self.text_encoder_m],
-                            [self.text_proj,self.text_proj_m],
-                           ]
+            self.model_pairs = [[self.visual_encoder,self.visual_encoder_m],
+                                [self.vision_proj,self.vision_proj_m],
+                                [self.text_encoder,self.text_encoder_m],
+                                [self.text_proj,self.text_proj_m],
+                            ]
         
-        self.copy_params()
+            self.copy_params()
 
         # create the queue
         self.register_buffer("image_queue", torch.randn(embed_dim, self.queue_size))
@@ -82,8 +87,7 @@ class ALBEF(nn.Module):
                              
         self.image_queue = nn.functional.normalize(self.image_queue, dim=0)
         self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
-
-
+    
 
     def forward(self, image, text, alpha=0):
         with torch.no_grad():
@@ -94,124 +98,167 @@ class ALBEF(nn.Module):
 
         image_feat = F.normalize(self.vision_proj(image_embeds[:,0,:]),dim=-1)  
 
-        text_output = self.text_encoder.bert(text.input_ids, attention_mask = text.attention_mask,                      
-                                        return_dict = True, mode = 'text')            
-        text_embeds = text_output.last_hidden_state
-        text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)                 
-             
-        # get momentum features
-        with torch.no_grad():
-            self._momentum_update()
-            image_embeds_m = self.visual_encoder_m(image) 
-            image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1)  #B,D
-            image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)   #D,N_i                                    
-            text_output_m = self.text_encoder_m.bert(text.input_ids, attention_mask = text.attention_mask,                      
-                                                return_dict = True, mode = 'text')    
-            text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
-            text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1) #D, N_t
+        if self.text_encoder_mode=='generation':
+            loss_itm = 0 #now only support loss_mlm, loss_ita
+            #1. Mask text_ids 
+            input_ids = text.input_ids.clone()
+            labels = input_ids.clone()
+            probability_matrix = torch.full(labels.shape, self.mlm_probability)                    
+            input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, image.device, targets=labels,
+                                        probability_matrix = probability_matrix)   
+            text_output = self.text_encoder.bert(input_ids, attention_mask = text.attention_mask,    
+                                            is_decoder = True, #important!                  
+                                            return_dict = True, mode = 'text')            
+            text_embeds = text_output.last_hidden_state
+            
+            #we don't use [CLS] embedding here to compute text_feat, instead we use pooling (watch out for the padding token)
+            #text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)    
+            #text_feat = F.normalize(self.text_proj(text_embeds.mean(dim=1)),dim=-1)  
+            pooled_embeds = torch.sum(text_embeds*text.attention_mask[:,:,None], dim=1)/torch.sum(text.attention_mask,dim=-1, keepdims=True) #B,L,D *B,L,1 -> B,L,D ->B,D/B,1
+            text_feat = F.normalize(self.text_proj(pooled_embeds),dim=-1)   #B,D
 
-            sim_i2t_m = image_feat_m @ text_feat_all / self.temp  # B, D @ D,N_t  (B, N_t)
-            sim_t2i_m = text_feat_m @ image_feat_all / self.temp # B, D @ D, N_i   (B, N_i)
-
-            sim_targets = torch.zeros(sim_i2t_m.size()).to(image.device) #(B, N_t) (N_t==N_i?)
-            sim_targets.fill_diagonal_(1)          
-
-            sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
-            sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets        
-
-        sim_i2t = image_feat @ text_feat_all / self.temp  #(B,N)
-        sim_t2i = text_feat @ image_feat_all / self.temp 
-                             
-        loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_i2t_targets,dim=1).mean()
-        loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_t2i_targets,dim=1).mean() 
-
-        loss_ita = (loss_i2t+loss_t2i)/2
-
-        self._dequeue_and_enqueue(image_feat_m, text_feat_m)
-
-        ###=================================###
-        # forward the positve image-text pair
-        output_pos = self.text_encoder.bert(encoder_embeds = text_embeds, 
+            mlm_output = self.text_encoder(encoder_embeds = text_embeds, 
                                         attention_mask = text.attention_mask,
                                         encoder_hidden_states = image_embeds,
                                         encoder_attention_mask = image_atts,      
                                         return_dict = True,
-                                        mode = 'fusion',
-                                       )            
-        with torch.no_grad():
-            bs = image.size(0)          
-            weights_i2t = F.softmax(sim_i2t[:,:bs],dim=1) #(B,B)
-            weights_t2i = F.softmax(sim_t2i[:,:bs],dim=1)
-   
-            weights_i2t.fill_diagonal_(0) #do not choose the positive sample
-            weights_t2i.fill_diagonal_(0)
+                                        is_decoder = True, #!! important
+                                        labels = labels, mode='fusion'  
+                                        ) 
+                         
+            loss_mlm = mlm_output.loss 
+            
+            sim_i2t = image_feat @ text_feat.t() / self.temp  #(B,N)
+            sim_t2i = text_feat @ image_feat.t() / self.temp 
+            sim_targets = torch.zeros(sim_i2t.size()).to(image.device) #(B, N_t) (N_t==N_i?)
+            sim_targets.fill_diagonal_(1)   
+            loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_targets,dim=1).mean()
+            loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_targets,dim=1).mean() 
+            loss_ita = (loss_i2t+loss_t2i)/2
+            
+            loss_itm = torch.zeros_like(loss_ita)
+            return loss_mlm, loss_ita, loss_itm
+        
+        
+        elif self.text_encoder_mode=='retrieval':
+            text_output = self.text_encoder.bert(text.input_ids, attention_mask = text.attention_mask,                      
+                                            return_dict = True, mode = 'text')            
+            text_embeds = text_output.last_hidden_state
+            text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)                 
+                
+            # get momentum features
+            with torch.no_grad():
+                self._momentum_update()
+                image_embeds_m = self.visual_encoder_m(image) 
+                image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1)  #B,D
+                image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)   #D,N_i                                    
+                text_output_m = self.text_encoder_m.bert(text.input_ids, attention_mask = text.attention_mask,                      
+                                                    return_dict = True, mode = 'text')    
+                text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
+                text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1) #D, N_t
 
-        # select a negative image for each text
-        image_embeds_neg = []    
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2i[b], 1).item()  #B 
-            image_embeds_neg.append(image_embeds[neg_idx])
-        image_embeds_neg = torch.stack(image_embeds_neg,dim=0)    #B,
+                sim_i2t_m = image_feat_m @ text_feat_all / self.temp  # B, D @ D,N_t  (B, N_t)
+                sim_t2i_m = text_feat_m @ image_feat_all / self.temp # B, D @ D, N_i   (B, N_i)
 
-        # select a negative text for each image
-        text_embeds_neg = []
-        text_atts_neg = []
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
-            text_embeds_neg.append(text_embeds[neg_idx])
-            text_atts_neg.append(text.attention_mask[neg_idx])
-        text_embeds_neg = torch.stack(text_embeds_neg,dim=0)   #B,D
-        text_atts_neg = torch.stack(text_atts_neg,dim=0)      #B
+                sim_targets = torch.zeros(sim_i2t_m.size()).to(image.device) #(B, N_t) (N_t==N_i?)
+                sim_targets.fill_diagonal_(1)          
 
-        text_embeds_all = torch.cat([text_embeds, text_embeds_neg],dim=0)      #2B, d
-        text_atts_all = torch.cat([text.attention_mask, text_atts_neg],dim=0)     
+                sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
+                sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets        
 
-        image_embeds_all = torch.cat([image_embeds_neg,image_embeds],dim=0) #2B,D
-        image_atts_all = torch.cat([image_atts,image_atts],dim=0)
+            sim_i2t = image_feat @ text_feat_all / self.temp  #(B,N)
+            sim_t2i = text_feat @ image_feat_all / self.temp 
+                                
+            loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_i2t_targets,dim=1).mean()
+            loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_t2i_targets,dim=1).mean() 
 
-        output_neg = self.text_encoder.bert(encoder_embeds = text_embeds_all, #2B,N
-                                        attention_mask = text_atts_all,
-                                        encoder_hidden_states = image_embeds_all,
-                                        encoder_attention_mask = image_atts_all,      
+            loss_ita = (loss_i2t+loss_t2i)/2
+
+            self._dequeue_and_enqueue(image_feat_m, text_feat_m)
+
+            ###=================================###
+            # forward the positve image-text pair
+            output_pos = self.text_encoder.bert(encoder_embeds = text_embeds, 
+                                            attention_mask = text.attention_mask,
+                                            encoder_hidden_states = image_embeds,
+                                            encoder_attention_mask = image_atts,      
+                                            return_dict = True,
+                                            mode = 'fusion',
+                                        )            
+            with torch.no_grad():
+                bs = image.size(0)          
+                weights_i2t = F.softmax(sim_i2t[:,:bs],dim=1) #(B,B)
+                weights_t2i = F.softmax(sim_t2i[:,:bs],dim=1)
+
+                weights_i2t.fill_diagonal_(0) #do not choose the positive sample
+                weights_t2i.fill_diagonal_(0)
+
+            # select a negative image for each text
+            image_embeds_neg = []    
+            for b in range(bs):
+                neg_idx = torch.multinomial(weights_t2i[b], 1).item()  #B 
+                image_embeds_neg.append(image_embeds[neg_idx])
+            image_embeds_neg = torch.stack(image_embeds_neg,dim=0)    #B,
+
+            # select a negative text for each image
+            text_embeds_neg = []
+            text_atts_neg = []
+            for b in range(bs):
+                neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+                text_embeds_neg.append(text_embeds[neg_idx])
+                text_atts_neg.append(text.attention_mask[neg_idx])
+            text_embeds_neg = torch.stack(text_embeds_neg,dim=0)   #B,D
+            text_atts_neg = torch.stack(text_atts_neg,dim=0)      #B
+
+            text_embeds_all = torch.cat([text_embeds, text_embeds_neg],dim=0)      #2B, d
+            text_atts_all = torch.cat([text.attention_mask, text_atts_neg],dim=0)     
+
+            image_embeds_all = torch.cat([image_embeds_neg,image_embeds],dim=0) #2B,D
+            image_atts_all = torch.cat([image_atts,image_atts],dim=0)
+
+            output_neg = self.text_encoder.bert(encoder_embeds = text_embeds_all, #2B,N
+                                            attention_mask = text_atts_all,
+                                            encoder_hidden_states = image_embeds_all,
+                                            encoder_attention_mask = image_atts_all,      
+                                            return_dict = True,
+                                            mode = 'fusion',
+                                        )                         
+
+            vl_embeddings = torch.cat([output_pos.last_hidden_state[:,0,:], output_neg.last_hidden_state[:,0,:]],dim=0)
+            vl_output = self.itm_head(vl_embeddings)            
+
+            itm_labels = torch.cat([torch.ones(bs,dtype=torch.long),torch.zeros(2*bs,dtype=torch.long)],
+                                dim=0).to(image.device)
+            loss_itm = F.cross_entropy(vl_output, itm_labels)     
+            
+            ##================= MLM ========================##                
+            input_ids = text.input_ids.clone()
+            labels = input_ids.clone()
+
+            probability_matrix = torch.full(labels.shape, self.mlm_probability)                    
+            input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, image.device, targets=labels,
+                                        probability_matrix = probability_matrix) 
+            
+            with torch.no_grad():
+                logits_m = self.text_encoder_m(input_ids, 
+                                            attention_mask = text.attention_mask,
+                                            encoder_hidden_states = image_embeds_m,
+                                            encoder_attention_mask = image_atts,      
+                                            return_dict = True,
+                                            return_logits = True,   
+                                            )   
+            mlm_output = self.text_encoder(input_ids, 
+                                        attention_mask = text.attention_mask,
+                                        encoder_hidden_states = image_embeds,
+                                        encoder_attention_mask = image_atts,      
                                         return_dict = True,
-                                        mode = 'fusion',
-                                       )                         
+                                        labels = labels,   
+                                        soft_labels = F.softmax(logits_m,dim=-1),
+                                        alpha = alpha
+                                        )                           
+            loss_mlm = mlm_output.loss        
 
-        vl_embeddings = torch.cat([output_pos.last_hidden_state[:,0,:], output_neg.last_hidden_state[:,0,:]],dim=0)
-        vl_output = self.itm_head(vl_embeddings)            
-
-        itm_labels = torch.cat([torch.ones(bs,dtype=torch.long),torch.zeros(2*bs,dtype=torch.long)],
-                               dim=0).to(image.device)
-        loss_itm = F.cross_entropy(vl_output, itm_labels)     
-        
-        ##================= MLM ========================##                
-        input_ids = text.input_ids.clone()
-        labels = input_ids.clone()
-
-        probability_matrix = torch.full(labels.shape, self.mlm_probability)                    
-        input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, image.device, targets=labels,
-                                      probability_matrix = probability_matrix) 
-        
-        with torch.no_grad():
-            logits_m = self.text_encoder_m(input_ids, 
-                                           attention_mask = text.attention_mask,
-                                           encoder_hidden_states = image_embeds_m,
-                                           encoder_attention_mask = image_atts,      
-                                           return_dict = True,
-                                           return_logits = True,   
-                                          )    
-        mlm_output = self.text_encoder(input_ids, 
-                                       attention_mask = text.attention_mask,
-                                       encoder_hidden_states = image_embeds,
-                                       encoder_attention_mask = image_atts,      
-                                       return_dict = True,
-                                       labels = labels,   
-                                       soft_labels = F.softmax(logits_m,dim=-1),
-                                       alpha = alpha
-                                      )                           
-        loss_mlm = mlm_output.loss        
-
-        return loss_mlm, loss_ita, loss_itm  
+            return loss_mlm, loss_ita, loss_itm  
 
         
 

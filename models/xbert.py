@@ -55,9 +55,10 @@ from transformers.modeling_utils import (
 )
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
-
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 import transformers
 transformers.logging.set_verbosity_error()
+BERT_LIKE = True
 
 logger = logging.get_logger(__name__)
 
@@ -1323,20 +1324,24 @@ class BertLMHeadModel(BertPreTrainedModel):
         # cut decoder_input_ids if past is used
         if past is not None:
             input_ids = input_ids[:, -1:]
-
+            past_key_values = past
+        else:
+            past_key_values = None #TODO
         return {
             "input_ids": input_ids, 
             "attention_mask": attention_mask, 
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "encoder_hidden_states": model_kwargs.get("encoder_hidden_states", None),
             "encoder_attention_mask": model_kwargs.get("encoder_attention_mask", None),
             "is_decoder": True,
+            'use_cache': True #TODO
         }
 
     def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
         for layer_past in past:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+            #remove the last token ([MASK])
+            reordered_past += (tuple(past_state.index_select(0, beam_idx)[:,:-1,:] for past_state in layer_past),)
         return reordered_past
 
 
@@ -1387,6 +1392,8 @@ class BertForMaskedLM(BertPreTrainedModel):
         soft_labels=None,
         alpha=0,
         return_logits=False,
+        past_key_values=None,
+        use_cache=None
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -1397,6 +1404,13 @@ class BertForMaskedLM(BertPreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # print('input_ids', input_ids)
+        # print('attention_mask', attention_mask, 'token_type_ids', token_type_ids)
+        # print('encoder_hidden_states', encoder_hidden_states.shape)
+        # print('encoder_attention_mask', encoder_attention_mask.shape)
+        # print('is decoder=', is_decoder, 'mode=', mode)
+        # print('past_key_values', None if past_key_values==None else len(past_key_values))
+        # print('use_cache', use_cache)
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
@@ -1412,6 +1426,8 @@ class BertForMaskedLM(BertPreTrainedModel):
             return_dict=return_dict,
             is_decoder=is_decoder,
             mode=mode,
+            past_key_values=past_key_values, 
+            use_cache=use_cache
         )
 
         sequence_output = outputs[0]
@@ -1422,9 +1438,13 @@ class BertForMaskedLM(BertPreTrainedModel):
 
         masked_lm_loss = None
         if labels is not None:
+            #print('input_ids', input_ids[0,:])
+            # print('labels', labels[0,:])
+            # print(torch.argsort(-1*prediction_scores[0], dim=-1))
+            # input()
             loss_fct = CrossEntropyLoss()  # -100 index = padding token
             masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
-        
+
         if soft_labels is not None:
             loss_distill = -torch.sum(F.log_softmax(prediction_scores, dim=-1)*soft_labels,dim=-1)
             loss_distill = loss_distill[labels!=-100].mean()
@@ -1434,14 +1454,68 @@ class BertForMaskedLM(BertPreTrainedModel):
             output = (prediction_scores,) + outputs[2:]
             return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
 
-        return MaskedLMOutput(
+        # print(prediction_scores.shape, torch.argsort(prediction_scores*-1, dim=-1)[:,-1,:5]) #B,5
+        # input()
+        output = MaskedLMOutput(
             loss=masked_lm_loss,
             logits=prediction_scores,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            #past_key_values=outputs.past_key_values 
         )
+        output.__setitem__('past_key_values', outputs.past_key_values )
+        return output
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **model_kwargs):
+    @staticmethod
+    def _update_model_kwargs_for_generation(
+        outputs: ModelOutput, model_kwargs: Dict[str, Any], is_encoder_decoder: bool = False
+    ) -> Dict[str, Any]:
+        # update past
+        if "past_key_values" in outputs:
+            model_kwargs["past"] = outputs.past_key_values
+        elif "mems" in outputs:
+            model_kwargs["past"] = outputs.mems
+        elif "past_buckets_states" in outputs:
+            model_kwargs["past"] = outputs.past_buckets_states
+        else:
+            model_kwargs["past"] = None
+
+        # update token_type_ids with last value
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1)
+
+        # update attention mask
+        if not is_encoder_decoder:
+            if "attention_mask" in model_kwargs:
+                attention_mask = model_kwargs["attention_mask"]
+                model_kwargs["attention_mask"] = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+
+        return model_kwargs
+
+    @staticmethod
+    def _reorder_cache(past, beam_idx):
+        reordered_past = ()
+        for layer_past in past:
+            # cached cross_attention states don't have to be reordered -> they are always the same
+            if BERT_LIKE:
+                reordered_past += ( #B,H,L,D
+                    tuple(past_state.index_select(0, beam_idx)[:,:,:-1,:] for past_state in layer_past[:2]) + layer_past[2:],
+                )    #remove the last token ([MASK]        
+            else:
+                reordered_past += ( #B,H,L,D
+                    tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
+                ) 
+        #print('past.shape', len(example), example[0].shape, example[-1].shape) #B=5, 12(H), 19, 64
+        return reordered_past
+
+    def prepare_inputs_for_generation(self, 
+            input_ids, 
+            encoder_hidden_states, encoder_attention_mask, use_cache,
+            **model_kwargs):    
+        '''
         input_shape = input_ids.shape
         effective_batch_size = input_shape[0]
 
@@ -1454,6 +1528,28 @@ class BertForMaskedLM(BertPreTrainedModel):
         input_ids = torch.cat([input_ids, dummy_token], dim=1)
 
         return {"input_ids": input_ids, "attention_mask": attention_mask}
+        '''
+        #input_ids does not include [MASK]
+        if 'past' in model_kwargs and use_cache:
+            input_ids = input_ids[:,-1:] #B,1 #the token that is just generated
+            past_key_values = model_kwargs['past']
+        else:
+            past_key_values = None
+        if BERT_LIKE: #add mask_token
+            appended_mask = torch.ones_like(input_ids[:,-1:])*self.config.mask_token_id #[last token, [MASK]]
+            input_ids = torch.cat([input_ids, appended_mask], dim=-1) #B,2
+        outputs = {
+            "encoder_hidden_states": encoder_hidden_states, 
+            "encoder_attention_mask": encoder_attention_mask,
+            #'past_key_values': past_key_values,
+            'input_ids': input_ids,
+            'attention_mask': None,
+            'is_decoder': True, #this is really important to generate causal mask
+            'mode': 'multi_modal',
+             'use_cache': use_cache}
+        if past_key_values!=None and use_cache:
+            outputs['past_key_values'] = past_key_values
+        return outputs
 
 
 @add_start_docstrings(

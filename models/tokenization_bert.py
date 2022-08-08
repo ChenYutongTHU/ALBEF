@@ -171,6 +171,7 @@ class BertTokenizer(PreTrainedTokenizer):
         mask_token="[MASK]",
         tokenize_chinese_chars=True,
         strip_accents=None,
+        add_sep=False,
         **kwargs
     ):
         super().__init__(
@@ -203,7 +204,7 @@ class BertTokenizer(PreTrainedTokenizer):
                 strip_accents=strip_accents,
             )
         self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab, unk_token=self.unk_token)
-
+        self.add_sep = add_sep
     @property
     def do_lower_case(self):
         return self.basic_tokenizer.do_lower_case
@@ -227,6 +228,8 @@ class BertTokenizer(PreTrainedTokenizer):
                     split_tokens += self.wordpiece_tokenizer.tokenize(token)
         else:
             split_tokens = self.wordpiece_tokenizer.tokenize(text)
+        if self.add_sep:
+            split_tokens.append(self.sep_token)
         return split_tokens
 
     def _convert_token_to_id(self, token):

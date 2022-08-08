@@ -1,3 +1,4 @@
+data/
 submit_itp.py
 *.sh 
 *.ipynb
