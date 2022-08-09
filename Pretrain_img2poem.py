@@ -172,6 +172,12 @@ def main(args, config):
     
     print("Start training")
     start_time = time.time()
+    if utils.is_main_process() and config.get('mode','retrieval') == 'generation':
+        #evaluation
+        print(f'Evaluate @ epoch=-1 for generation model')
+        test_img2poem_gen(args, model.module, config, tokenizer, device, epoch=-1, wandb_run=wandb_run)
+    dist.barrier()  
+    
     for epoch in range(start_epoch, max_epoch):
         
         if epoch>0:
@@ -197,7 +203,7 @@ def main(args, config):
             if config.get('mode','retrieval') == 'generation':
                 #evaluation
                 print(f'Evaluate @ epoch={epoch} for generation model')
-                test_img2poem_gen(args, model.module, config, tokenizer, device, wandb_run)
+                test_img2poem_gen(args, model.module, config, tokenizer, device, epoch, wandb_run)
 
         dist.barrier()  
                 

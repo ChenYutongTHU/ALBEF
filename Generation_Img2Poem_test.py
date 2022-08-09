@@ -31,7 +31,7 @@ from tqdm import tqdm
 import wandb
 
 @torch.no_grad()
-def test_img2poem_gen(args, model, config, tokenizer, device, wandb_run=None):
+def test_img2poem_gen(args, model, config, tokenizer, device, epoch=None, wandb_run=None):
     model.eval()
     datasets = [create_dataset('gen_img2poem', config)]
     samplers = [None]
@@ -82,7 +82,9 @@ def test_img2poem_gen(args, model, config, tokenizer, device, wandb_run=None):
         wandb.log({'eval/ppl': total_ppl})
     output_dir_result = os.path.join(args.output_dir, 'generation_results')
     os.makedirs(output_dir_result, exist_ok=True)
-    with open(os.path.join(output_dir_result, 'imgfile2results.json'),'w') as f:
+    output_file = os.path.join(output_dir_result, 
+                               f'imgfile2results_epoch{epoch}.json' if epoch else 'imgfile2results.json')
+    with open(output_file,'w') as f:
         json.dump(filename2result, f)
 
 def main(args, config):
