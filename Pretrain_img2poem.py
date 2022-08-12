@@ -110,33 +110,13 @@ def main(args, config):
     max_epoch = config['schedular']['epochs']
     warmup_steps = config['schedular']['warmup_epochs']    
 
-    #### Dataset #### 
-    print("Creating dataset")
-    datasets = [create_dataset('pretrain', config)]
-    
-    if args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()            
-        samplers = create_sampler(datasets, [True], num_tasks, global_rank)         
-    else:
-        samplers = [None]
 
-    data_loader = create_loader(datasets,samplers,batch_size=[config['batch_size']], num_workers=[4], is_trains=[True], collate_fns=[None])[0]
 
     tokenizer = BertTokenizer.from_pretrained(args.text_encoder, add_sep=(config.get('mode','retrieval')=='generation'))
 
     #### Model #### 
     print("Creating model")
     model = ALBEF(config=config, text_encoder=args.text_encoder, tokenizer=tokenizer, init_deit=True)
-    
-    model = model.to(device)   
-        
-    arg_opt = utils.AttrDict(config['optimizer'])
-    optimizer = create_optimizer(arg_opt, model)
-    arg_sche = utils.AttrDict(config['schedular'])
-    lr_scheduler, _ = create_scheduler(arg_sche, optimizer)  
-
-    
     if 'load_pretrained' in config:
         assert os.path.isfile(config['load_pretrained'])
         args.checkpoint = config['load_pretrained']
@@ -160,10 +140,38 @@ def main(args, config):
                 if m_module in k and not hasattr(model, m_module):
                     Flag = False
                     break
-            if Flag:
-                state_dict_to_load[k] = v
-        model.load_state_dict(state_dict_to_load, strict=True)    
-        print('load checkpoint from %s'%args.checkpoint)
+            if config.get('only_load_visual_encoder', False) == True:
+                if 'visual_encoder' in k and Flag:
+                    state_dict_to_load[k.replace('visual_encoder.','')] = v 
+            else:
+                if Flag:
+                    state_dict_to_load[k] = v
+        if config.get('only_load_visual_encoder', False) == True:
+            model.visual_encoder.load_state_dict(state_dict_to_load, strict=True)  
+        else:
+            model.load_state_dict(state_dict_to_load, strict=True)    
+        print('load checkpoint from %s'%args.checkpoint)    
+    model = model.to(device)   
+
+        
+    arg_opt = utils.AttrDict(config['optimizer'])
+    optimizer = create_optimizer(arg_opt, model)
+    arg_sche = utils.AttrDict(config['schedular'])
+    lr_scheduler, _ = create_scheduler(arg_sche, optimizer)  
+
+
+    #### Dataset #### 
+    print("Creating dataset")
+    datasets = [create_dataset('pretrain', config)]
+    
+    if args.distributed:
+        num_tasks = utils.get_world_size()
+        global_rank = utils.get_rank()            
+        samplers = create_sampler(datasets, [True], num_tasks, global_rank)         
+    else:
+        samplers = [None]
+
+    data_loader = create_loader(datasets,samplers,batch_size=[config['batch_size']], num_workers=[4], is_trains=[True], collate_fns=[None])[0]
     
     model_without_ddp = model
     if args.distributed:
@@ -233,4 +241,8 @@ if __name__ == '__main__':
 
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))    
     
+    if 'text_encoder' in config:
+        args.text_encoder = config['text_encoder']
+        print('Overwrite args.text_encoder as ', args.text_encoder)
+        
     main(args, config)

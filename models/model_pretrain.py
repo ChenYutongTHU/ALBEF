@@ -8,6 +8,7 @@
 from functools import partial
 from models.vit import VisionTransformer, interpolate_pos_embed
 from models.xbert import BertConfig, BertForMaskedLM, BERT_LIKE
+from models.xgpt import GPT2Config, GPT2LMHeadModel
 from  transformers.modeling_outputs import BaseModelOutput
 import torch
 import torch.nn.functional as F
@@ -46,15 +47,27 @@ class ALBEF(nn.Module):
             msg = self.visual_encoder.load_state_dict(state_dict,strict=False)
             print(msg)          
             
-        vision_width = config['vision_width']       
-        bert_config = BertConfig.from_json_file(config['bert_config'])
-        
-        self.text_encoder_mode = config.get('mode','retrieval')
-        if self.text_encoder_mode == 'generation':
-            bert_config.is_encoder_decoder = True
-            bert_config.mask_token_id = tokenizer.mask_token_id
-        self.text_encoder = BertForMaskedLM.from_pretrained(text_encoder, config=bert_config)      
+        vision_width = config['vision_width']     
+        self.text_encoder_mode = config.get('mode','retrieval')  
+        if 'bert' in text_encoder.lower():
+            self.text_encoder_type='bert'
+            bert_config = BertConfig.from_json_file(config['bert_config'])
+            if self.text_encoder_mode == 'generation':
+                bert_config.is_encoder_decoder = True
+                bert_config.mask_token_id = tokenizer.mask_token_id
+            self.text_encoder, loading_info = BertForMaskedLM.from_pretrained(text_encoder, config=bert_config, output_loading_info=True)   
+        elif 'gpt' in text_encoder.lower():
+            self.text_encoder_type='gpt'
+            assert self.text_encoder_mode=='generation', self.text_encoder_mode
+            gpt_config = GPT2Config.from_pretrained(config['gpt2_config']) #fusion_layer
+            if 'fusion_layer' in config:
+                gpt_config.fusion_layer = config['fusion_layer']
+                print('Overwrite GPT2Config.fusion_layer to ', gpt_config.fusion_layer)
+            self.text_encoder, loading_info = GPT2LMHeadModel.from_pretrained(text_encoder, config=gpt_config, output_loading_info=True)
+        else:
+            raise ValueError   
 
+        print(loading_info)    
         text_width = self.text_encoder.config.hidden_size
         self.vision_proj = nn.Linear(vision_width, embed_dim)
         self.text_proj = nn.Linear(text_width, embed_dim)         
@@ -100,45 +113,98 @@ class ALBEF(nn.Module):
         image_feat = F.normalize(self.vision_proj(image_embeds[:,0,:]),dim=-1)  
 
         if self.text_encoder_mode=='generation':
-            loss_itm = 0 #now only support loss_mlm, loss_ita
-            #1. Mask text_ids 
-            input_ids = text.input_ids.clone()
-            labels = input_ids.clone()
-            probability_matrix = torch.full(labels.shape, self.mlm_probability)                    
-            input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, image.device, targets=labels,
-                                        probability_matrix = probability_matrix)   
-            text_output = self.text_encoder.bert(input_ids, attention_mask = text.attention_mask,    
-                                            is_decoder = True, #important!                  
-                                            return_dict = True, mode = 'text')            
-            text_embeds = text_output.last_hidden_state
-            
-            #we don't use [CLS] embedding here to compute text_feat, instead we use pooling (watch out for the padding token)
-            #text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)    
-            #text_feat = F.normalize(self.text_proj(text_embeds.mean(dim=1)),dim=-1)  
-            pooled_embeds = torch.sum(text_embeds*text.attention_mask[:,:,None], dim=1)/torch.sum(text.attention_mask,dim=-1, keepdims=True) #B,L,D *B,L,1 -> B,L,D ->B,D/B,1
-            text_feat = F.normalize(self.text_proj(pooled_embeds),dim=-1)   #B,D
+            if self.text_encoder_type == 'bert':
+                #1. Mask text_ids 
+                input_ids = text.input_ids.clone()
+                labels = input_ids.clone()
+                probability_matrix = torch.full(labels.shape, self.mlm_probability)                    
+                input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, image.device, targets=labels,
+                                            probability_matrix = probability_matrix)  
+                if  self.text_encoder_type=='bert':
+                    text_output = self.text_encoder.bert(input_ids, attention_mask = text.attention_mask,    
+                                                    is_decoder = True, #important!                  
+                                                    return_dict = True, mode = 'text')    
+                # elif self.text_encoder_type=='gpt':
+                #     text_output = self.text_encoder.transformer(input_ids, attention_mask=text.attention_mask,
+                #                         return_dict=True, mode='text')
+                text_embeds = text_output.last_hidden_state
+                
+                #we don't use [CLS] embedding here to compute text_feat, instead we use pooling (watch out for the padding token)
+                #text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)    
+                #text_feat = F.normalize(self.text_proj(text_embeds.mean(dim=1)),dim=-1)  
+                pooled_embeds = torch.sum(text_embeds*text.attention_mask[:,:,None], dim=1)/torch.sum(text.attention_mask,dim=-1, keepdims=True) #B,L,D *B,L,1 -> B,L,D ->B,D/B,1
+                text_feat = F.normalize(self.text_proj(pooled_embeds),dim=-1)   #B,D
 
-            mlm_output = self.text_encoder(encoder_embeds = text_embeds, 
-                                        attention_mask = text.attention_mask,
-                                        encoder_hidden_states = image_embeds,
-                                        encoder_attention_mask = image_atts,      
-                                        return_dict = True,
-                                        is_decoder = True, #!! important
-                                        labels = labels, mode='fusion'  
-                                        ) 
-                         
-            loss_mlm = mlm_output.loss 
+                mlm_output = self.text_encoder(encoder_embeds = text_embeds, 
+                                            attention_mask = text.attention_mask,
+                                            encoder_hidden_states = image_embeds,
+                                            encoder_attention_mask = image_atts,      
+                                            return_dict = True,
+                                            is_decoder = True, #!! important
+                                            labels = labels, mode='fusion'  
+                                            ) 
+                            
+                loss_mlm = mlm_output.loss 
+                sim_i2t = image_feat @ text_feat.t() / self.temp  #(B,N)
+                sim_t2i = text_feat @ image_feat.t() / self.temp 
+                sim_targets = torch.zeros(sim_i2t.size()).to(image.device) #(B, N_t) (N_t==N_i?)
+                sim_targets.fill_diagonal_(1)   
+                loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_targets,dim=1).mean()
+                loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_targets,dim=1).mean() 
+                loss_ita = (loss_i2t+loss_t2i)/2
+                
+                loss_itm = torch.zeros_like(loss_ita)
+                return loss_mlm, loss_ita, loss_itm
             
-            sim_i2t = image_feat @ text_feat.t() / self.temp  #(B,N)
-            sim_t2i = text_feat @ image_feat.t() / self.temp 
-            sim_targets = torch.zeros(sim_i2t.size()).to(image.device) #(B, N_t) (N_t==N_i?)
-            sim_targets.fill_diagonal_(1)   
-            loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_targets,dim=1).mean()
-            loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_targets,dim=1).mean() 
-            loss_ita = (loss_i2t+loss_t2i)/2
-            
-            loss_itm = torch.zeros_like(loss_ita)
-            return loss_mlm, loss_ita, loss_itm
+            elif self.text_encoder_type == 'gpt': #no-need to mask
+                labels = text.input_ids.clone()
+
+                labels[text.input_ids==self.tokenizer.pad_token_id] = -100 # We only compute loss on masked tokens 
+                # print('input_ids', text.input_ids)
+                # print('labels', labels)
+                # input()
+                if self.text_encoder.config.fusion_layer!=self.text_encoder.config.num_hidden_layers:
+                    text_output = self.text_encoder.transformer(text.input_ids,
+                                        return_dict=True, mode='text')
+                    text_embeds = text_output.last_hidden_state
+                    
+                    #we use [EOS] embedding here to compute text_feat
+                    eos_pos = torch.sum(text.attention_mask, dim=1) #debug
+                    #print(text.input_ids, text.attention_mask, eos_pos)
+                    text_feat = F.normalize(self.text_proj(text_embeds[torch.arange(text_embeds.shape[0]),eos_pos-1,:]),dim=-1)    
+
+                    mlm_output = self.text_encoder(inputs_embeds = text_embeds,  #encoder_embeds?->inputs_embeds
+                                                attention_mask = text.attention_mask,
+                                                encoder_hidden_states = image_embeds,
+                                                encoder_attention_mask = image_atts,      
+                                                return_dict = True,
+                                                labels = labels, mode='fusion'  
+                                                ) 
+                                
+                    loss_mlm = mlm_output.loss 
+                    sim_i2t = image_feat @ text_feat.t() / self.temp  #(B,N)
+                    sim_t2i = text_feat @ image_feat.t() / self.temp 
+                    sim_targets = torch.zeros(sim_i2t.size()).to(image.device) #(B, N_t) (N_t==N_i?)
+                    sim_targets.fill_diagonal_(1)   
+                    loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_targets,dim=1).mean()
+                    loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_targets,dim=1).mean() 
+                    loss_ita = (loss_i2t+loss_t2i)/2
+                else:
+                    mlm_output = self.text_encoder(
+                                                text.input_ids, 
+                                                attention_mask = text.attention_mask,
+                                                encoder_hidden_states = image_embeds,
+                                                encoder_attention_mask = image_atts,      
+                                                return_dict = True,
+                                                is_decoder = True, #!! important
+                                                labels = labels, mode='multi_modal'  
+                                                )  
+                    loss_mlm = mlm_output.loss  
+                    loss_ita = torch.zeros_like(loss_mlm)
+                loss_itm = torch.zeros_like(loss_mlm)    
+                return loss_mlm, loss_ita, loss_itm                  
+                
+
         
         
         elif self.text_encoder_mode=='retrieval':

@@ -60,13 +60,20 @@ def test_img2poem_gen(args, model, config, tokenizer, device, epoch=None, wandb_
             #[[101,t1,t2,...,511,102]]
             predict_logits = []
             for pos in range(1, text_input.input_ids.shape[1]): #
-                input_ids = torch.ones([1,pos+1], dtype=torch.long, device=device)*tokenizer.vocab[tokenizer.mask_token]
-                input_ids[:,:pos] = text_input.input_ids[:,:pos]
-                output = model.text_encoder(
-                    input_ids=input_ids,
-                    encoder_attention_mask = image_atts, encoder_hidden_states=image_embeds, 
-                    is_decoder=True, #!
-                    mode='multi_modal')
+                if model.text_encoder_type == 'bert':
+                    input_ids = torch.ones([1,pos+1], dtype=torch.long, device=device)*tokenizer.vocab[tokenizer.mask_token]
+                    input_ids[:,:pos] = text_input.input_ids[:,:pos]
+                    output = model.text_encoder(
+                        input_ids=input_ids,
+                        encoder_attention_mask = image_atts, encoder_hidden_states=image_embeds, 
+                        is_decoder=True, #!
+                        mode='multi_modal')
+                elif model.text_encoder_type == 'gpt':
+                    input_ids = text_input.input_ids[:,:pos]
+                    output = model.text_encoder(
+                        input_ids=input_ids,
+                        encoder_attention_mask = image_atts, encoder_hidden_states=image_embeds, 
+                        mode='multi_modal')
                 predict_logits.append(output.logits[0,-1,:]) #bs-1
             predict_logits = torch.stack(predict_logits, dim=0) #L,D 
             loss_fct = torch.nn.CrossEntropyLoss(reduction='none')  # -100 index = padding token
