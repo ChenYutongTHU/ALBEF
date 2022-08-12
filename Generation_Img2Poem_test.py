@@ -144,5 +144,9 @@ if __name__ == '__main__':
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     #print(args.output_dir, os.path.isdir(args.output_dir))
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))    
-    
+
+    if 'text_encoder' in config:
+        args.text_encoder = config['text_encoder']
+        print('Overwrite args.text_encoder as ', args.text_encoder)
+        
     main(args, config)

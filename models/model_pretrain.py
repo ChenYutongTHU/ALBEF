@@ -163,7 +163,7 @@ class ALBEF(nn.Module):
                 # print('input_ids', text.input_ids)
                 # print('labels', labels)
                 # input()
-                if self.text_encoder.config.fusion_layer!=self.text_encoder.config.num_hidden_layers:
+                if self.text_encoder.config.fusion_layer!=0:
                     text_output = self.text_encoder.transformer(text.input_ids,
                                         return_dict=True, mode='text')
                     text_embeds = text_output.last_hidden_state
