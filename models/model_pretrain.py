@@ -196,7 +196,6 @@ class ALBEF(nn.Module):
                                                 encoder_hidden_states = image_embeds,
                                                 encoder_attention_mask = image_atts,      
                                                 return_dict = True,
-                                                is_decoder = True, #!! important
                                                 labels = labels, mode='multi_modal'  
                                                 )  
                     loss_mlm = mlm_output.loss  
