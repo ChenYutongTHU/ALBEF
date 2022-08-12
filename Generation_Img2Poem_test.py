@@ -83,7 +83,7 @@ def test_img2poem_gen(args, model, config, tokenizer, device, epoch=None, wandb_
     output_dir_result = os.path.join(args.output_dir, 'generation_results')
     os.makedirs(output_dir_result, exist_ok=True)
     output_file = os.path.join(output_dir_result, 
-                               f'imgfile2results_epoch{epoch}.json' if epoch else 'imgfile2results.json')
+                               f'imgfile2results_epoch{epoch}.json' if epoch!=None else 'imgfile2results.json')
     with open(output_file,'w') as f:
         json.dump(filename2result, f)
 
@@ -100,7 +100,7 @@ def main(args, config):
     
     if os.path.isfile(args.checkpoint): 
         checkpoint = torch.load(args.checkpoint, map_location='cpu') 
-        state_dict = checkpoint['model']
+        state_dict, epoch = checkpoint['model'], checkpoint['epoch']
         # reshape positional embedding to accomodate for image resolution change
         pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)         
         state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped
@@ -111,7 +111,7 @@ def main(args, config):
         print(f'{args.checkpoint} does not exist')
     
     model = model.to(device)   
-    test_img2poem_gen(args, model, config, tokenizer, device)
+    test_img2poem_gen(args, model, config, tokenizer, device, epoch=epoch)
     return
 
 if __name__ == '__main__':
@@ -127,15 +127,15 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
-    args.output_dir = os.path.join('output', os.path.basename(args.config).split('.')[0], args.output_subdir)
-    args.checkpoint_dir = os.path.join('output', os.path.basename(args.config).split('.')[0])
+    args.output_dir = os.path.join('output', os.path.basename(args.config).replace('.yaml',''), args.output_subdir)
+    args.checkpoint_dir = os.path.join('output', os.path.basename(args.config).replace('.yaml',''))
     if args.checkpoint == 'latest':
         checkpoint_list = glob(os.path.join(args.checkpoint_dir, 'checkpoint_*.pth'))
         checkpoint_list = sorted(checkpoint_list, key=lambda c: int(os.path.basename(c).replace('checkpoint_','')[:-4]))
         args.checkpoint = checkpoint_list[-1]
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        
+    #print(args.output_dir, os.path.isdir(args.output_dir))
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))    
     
     main(args, config)
